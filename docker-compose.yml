@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  wfm-tool:
+    build: .
+    container_name: wfm-shift-tool
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    environment:
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - WFM_DB_PATH=/app/data
+    restart: unless-stopped
