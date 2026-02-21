@@ -13,6 +13,8 @@ class DatabaseManager:
     def get_connection(self):
         db_file = os.path.join(self.db_path, f"wfm_storage_{self.year}.db")
         conn = sqlite3.connect(db_file, check_same_thread=False)
+        # Enforce foreign key constraints
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -25,9 +27,10 @@ class DatabaseManager:
             conn.close()
 
     def init_database(self):
-        """Create all tables if they don't exist."""
+        """Create all permanent tables if they don't exist."""
         with self.connect() as conn:
             cursor = conn.cursor()
+
             # Agents master
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS agents_master (
@@ -52,6 +55,7 @@ class DatabaseManager:
                     updated_at TIMESTAMP
                 )
             """)
+
             # Shift dictionary
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS shift_dictionary (
@@ -64,6 +68,7 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
             # User access
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS user_access (
@@ -77,6 +82,7 @@ class DatabaseManager:
                     last_login TIMESTAMP
                 )
             """)
+
             # Audit log
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS audit_log (
@@ -93,6 +99,7 @@ class DatabaseManager:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
             # Error log
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS error_log (
@@ -112,6 +119,7 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
             # LOB groups
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS lob_groups (
@@ -121,124 +129,8 @@ class DatabaseManager:
                     is_active BOOLEAN DEFAULT 1
                 )
             """)
-            conn.commit()
 
-    def ensure_monthly_tables(self, year_month):
-        """year_month like '2025_01'"""
-        with self.connect() as conn:
-            cursor = conn.cursor()
-            # Roster original
-            cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS roster_original_{year_month} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    citrix_uid TEXT NOT NULL,
-                    acd_id TEXT,
-                    shift_date DATE NOT NULL,
-                    scheduled_shift TEXT,
-                    normalized_shift TEXT,
-                    shift_source TEXT DEFAULT 'Planner',
-                    source_file TEXT,
-                    uploaded_at TIMESTAMP,
-                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
-                )
-            """)
-            # Roster live (similar)
-            cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS roster_live_{year_month} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    citrix_uid TEXT NOT NULL,
-                    acd_id TEXT,
-                    shift_date DATE NOT NULL,
-                    scheduled_shift TEXT,
-                    normalized_shift TEXT,
-                    shift_source TEXT,
-                    modified_by TEXT,
-                    modified_at TIMESTAMP,
-                    approved_by TEXT,
-                    approved_at TIMESTAMP,
-                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
-                )
-            """)
-            # CMS raw
-            cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS cms_raw_{year_month} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    report_date DATE NOT NULL,
-                    agent_name TEXT,
-                    login_id TEXT,
-                    citrix_uid TEXT,
-                    acd_id TEXT,
-                    ans_calls INTEGER DEFAULT 0,
-                    handle_time_sec INTEGER DEFAULT 0,
-                    avail_time_sec INTEGER DEFAULT 0,
-                    staffed_time_sec INTEGER DEFAULT 0,
-                    talk_time_sec INTEGER DEFAULT 0,
-                    hold_time_sec INTEGER DEFAULT 0,
-                    acw_time_sec INTEGER DEFAULT 0,
-                    upload_batch TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
-                )
-            """)
-            # Aspect raw
-            cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS aspect_raw_{year_month} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_name TEXT,
-                    login_id TEXT,
-                    citrix_uid TEXT,
-                    acd_id TEXT,
-                    event_date DATE NOT NULL,
-                    login_time DATETIME,
-                    logout_time DATETIME,
-                    logout_reason TEXT,
-                    session_duration_sec INTEGER,
-                    upload_batch TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
-                )
-            """)
-            # EIM raw (same structure as aspect)
-            cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS eim_raw_{year_month} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_name TEXT,
-                    login_id TEXT,
-                    citrix_uid TEXT,
-                    acd_id TEXT,
-                    event_date DATE NOT NULL,
-                    login_time DATETIME,
-                    logout_time DATETIME,
-                    session_duration_sec INTEGER,
-                    upload_batch TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
-                )
-            """)
-            # Attendance processed
-            cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS attendance_processed_{year_month} (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    citrix_uid TEXT NOT NULL,
-                    acd_id TEXT,
-                    shift_date DATE NOT NULL,
-                    original_shift TEXT,
-                    updated_shift TEXT,
-                    staff_time_sec INTEGER DEFAULT 0,
-                    staff_time_min REAL,
-                    staff_time_validation TEXT,
-                    attendance_status TEXT,
-                    absenteeism_reason TEXT,
-                    final_shift TEXT,
-                    hc_status TEXT,
-                    data_source TEXT,
-                    confidence_score INTEGER,
-                    notes TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
-                )
-            """)
-            # Shift swaps
+            # Shift swaps (moved from ensure_monthly_tables)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS shift_swaps (
                     swap_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,10 +155,166 @@ class DatabaseManager:
                     FOREIGN KEY (agent_b_citrix) REFERENCES agents_master(citrix_uid)
                 )
             """)
+
+            # CMS productivity aggregated data
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS cms_productivity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    citrix_uid TEXT NOT NULL,
+                    date DATE NOT NULL,
+                    handled INTEGER DEFAULT 0,
+                    talk_time INTEGER DEFAULT 0,
+                    acw INTEGER DEFAULT 0,
+                    hold_time INTEGER DEFAULT 0,
+                    year_month TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(citrix_uid, date, year_month)
+                )
+            """)
+
+            # Aspect/EIM raw events
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS aspect_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    citrix_uid TEXT NOT NULL,
+                    timestamp TIMESTAMP NOT NULL,
+                    event_type TEXT,
+                    duration INTEGER DEFAULT 0,
+                    aux_code TEXT,
+                    year_month TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            conn.commit()
+
+    def ensure_monthly_tables(self, year_month):
+        """Create month-specific tables for a given year_month (e.g., '2025_01')."""
+        with self.connect() as conn:
+            cursor = conn.cursor()
+
+            # Roster original
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS roster_original_{year_month} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    citrix_uid TEXT NOT NULL,
+                    acd_id TEXT,
+                    shift_date DATE NOT NULL,
+                    scheduled_shift TEXT,
+                    normalized_shift TEXT,
+                    shift_source TEXT DEFAULT 'Planner',
+                    source_file TEXT,
+                    uploaded_at TIMESTAMP,
+                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
+                )
+            """)
+
+            # Roster live (with approval tracking)
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS roster_live_{year_month} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    citrix_uid TEXT NOT NULL,
+                    acd_id TEXT,
+                    shift_date DATE NOT NULL,
+                    scheduled_shift TEXT,
+                    normalized_shift TEXT,
+                    shift_source TEXT,
+                    modified_by TEXT,
+                    modified_at TIMESTAMP,
+                    approved_by TEXT,
+                    approved_at TIMESTAMP,
+                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
+                )
+            """)
+
+            # CMS raw data
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS cms_raw_{year_month} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_date DATE NOT NULL,
+                    agent_name TEXT,
+                    login_id TEXT,
+                    citrix_uid TEXT,
+                    acd_id TEXT,
+                    ans_calls INTEGER DEFAULT 0,
+                    handle_time_sec INTEGER DEFAULT 0,
+                    avail_time_sec INTEGER DEFAULT 0,
+                    staffed_time_sec INTEGER DEFAULT 0,
+                    talk_time_sec INTEGER DEFAULT 0,
+                    hold_time_sec INTEGER DEFAULT 0,
+                    acw_time_sec INTEGER DEFAULT 0,
+                    upload_batch TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
+                )
+            """)
+
+            # Aspect raw data
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS aspect_raw_{year_month} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_name TEXT,
+                    login_id TEXT,
+                    citrix_uid TEXT,
+                    acd_id TEXT,
+                    event_date DATE NOT NULL,
+                    login_time DATETIME,
+                    logout_time DATETIME,
+                    logout_reason TEXT,
+                    session_duration_sec INTEGER,
+                    upload_batch TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
+                )
+            """)
+
+            # EIM raw data (same structure as aspect)
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS eim_raw_{year_month} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_name TEXT,
+                    login_id TEXT,
+                    citrix_uid TEXT,
+                    acd_id TEXT,
+                    event_date DATE NOT NULL,
+                    login_time DATETIME,
+                    logout_time DATETIME,
+                    session_duration_sec INTEGER,
+                    upload_batch TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
+                )
+            """)
+
+            # Attendance processed (final output)
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS attendance_processed_{year_month} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    citrix_uid TEXT NOT NULL,
+                    acd_id TEXT,
+                    shift_date DATE NOT NULL,
+                    original_shift TEXT,
+                    updated_shift TEXT,
+                    staff_time_sec INTEGER DEFAULT 0,
+                    staff_time_min REAL,
+                    staff_time_validation TEXT,
+                    attendance_status TEXT,
+                    absenteeism_reason TEXT,
+                    final_shift TEXT,
+                    hc_status TEXT,
+                    data_source TEXT,
+                    confidence_score INTEGER,
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (citrix_uid) REFERENCES agents_master(citrix_uid)
+                )
+            """)
+
             conn.commit()
 
     def log_error(self, error_type, source_file, source_type, raw_data,
                   agent_name=None, login_id=None, acd_id=None, shift_date=None):
+        """Convenience method to log an error."""
         with self.connect() as conn:
             conn.execute("""
                 INSERT INTO error_log

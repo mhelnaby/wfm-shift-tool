@@ -1,0 +1,177 @@
+# modules/upload_handlers.py
+import pandas as pd
+from datetime import datetime
+import re
+
+class UploadHandler:
+    def __init__(self, db, normalizer, audit):
+        self.db = db
+        self.normalizer = normalizer
+        self.audit = audit
+
+    def process_headcount(self, file):
+        """Process HC file and insert/update agents_master"""
+        try:
+            df = pd.read_csv(file) if file.name.endswith('.csv') else pd.read_excel(file)
+            # Expected columns: Citrix UID, ACD ID, Name, Queue, Team Leader, Supervisor, Manager, Status
+            required = ['Citrix UID', 'ACD ID', 'Name']
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                return {"success": False, "error": f"Missing columns: {missing}"}
+
+            updated = 0
+            new = 0
+            with self.db.connect() as conn:
+                for _, row in df.iterrows():
+                    citrix = row['Citrix UID']
+                    acd = row['ACD ID']
+                    name = row['Name']
+                    # check if exists
+                    cur = conn.execute("SELECT citrix_uid FROM agents_master WHERE citrix_uid = ?", (citrix,))
+                    exists = cur.fetchone()
+                    data = {
+                        'acd_id': acd,
+                        'name': name,
+                        'premises': row.get('Premises'),
+                        'segment': row.get('Segment'),
+                        'queue': row.get('Queue'),
+                        'language': row.get('Language'),
+                        'batch': row.get('Batch'),
+                        'date_of_join': row.get('Date of Join'),
+                        'certified_date': row.get('Certified Date'),
+                        'go_live_date': row.get('Go Live Date'),
+                        'team_leader': row.get('Team Leader'),
+                        'supervisor': row.get('Supervisor'),
+                        'manager': row.get('Manager'),
+                        'status': row.get('Status', 'Active'),
+                    }
+                    if exists:
+                        # update
+                        set_clause = ', '.join([f"{k}=?" for k in data.keys()])
+                        values = list(data.values()) + [citrix]
+                        conn.execute(f"UPDATE agents_master SET {set_clause} WHERE citrix_uid=?", values)
+                        updated += 1
+                    else:
+                        # insert
+                        cols = ','.join(data.keys())
+                        placeholders = ','.join(['?' for _ in data])
+                        values = list(data.values())
+                        conn.execute(f"INSERT INTO agents_master (citrix_uid, {cols}) VALUES (?, {placeholders})", [citrix] + values)
+                        new += 1
+                conn.commit()
+            return {"success": True, "agents_updated": updated, "new_agents": new}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def process_roster(self, file, mapping, year_month):
+        """
+        معالجة ملف Roster (جدول المناوبات) وإدراج البيانات في قاعدة البيانات.
+        mapping يحتوي على أسماء الأعمدة المختارة.
+        """
+        try:
+            # قراءة الملف
+            if file.name.endswith('.csv'):
+                df = pd.read_csv(file)
+            else:
+                df = pd.read_excel(file)
+
+            name_col = mapping['name_col']
+            citrix_col = mapping.get('citrix_col')
+            acd_col = mapping.get('acd_col')
+            login_col = mapping.get('login_col')
+            date_cols = mapping['date_cols']
+
+            # التحقق من وجود الأعمدة
+            if name_col not in df.columns:
+                return {"success": False, "error": f"Column '{name_col}' not found."}
+            for col in date_cols:
+                if col not in df.columns:
+                    return {"success": False, "error": f"Date column '{col}' not found."}
+
+            # قائمة الأعمدة الثابتة (تستخدم للربط)
+            id_vars = [name_col]
+            if citrix_col and citrix_col != 'None' and citrix_col in df.columns:
+                id_vars.append(citrix_col)
+            if acd_col and acd_col != 'None' and acd_col in df.columns:
+                id_vars.append(acd_col)
+            if login_col and login_col != 'None' and login_col in df.columns:
+                id_vars.append(login_col)
+
+            # تحويل الجدول من العرض الطويل إلى الطولي
+            melted = df.melt(id_vars=id_vars, value_vars=date_cols,
+                             var_name='raw_date', value_name='raw_shift')
+
+            # تحويل التاريخ
+            # نفترض أن التاريخ بتنسيق يوم-شهر-سنة مثل 21-Feb-26
+            try:
+                melted['shift_date'] = pd.to_datetime(melted['raw_date'], format='%d-%b-%y', errors='coerce')
+            except:
+                melted['shift_date'] = pd.to_datetime(melted['raw_date'], errors='coerce')
+            melted = melted.dropna(subset=['shift_date'])
+
+            # تطبيع الشفتات باستخدام normalizer
+            melted['normalized_shift'] = melted['raw_shift'].apply(self.normalizer.normalize)
+
+            unknown_agents = []
+            records = []
+
+            with self.db.connect() as conn:
+                # بناء قاموس لربط الاسم بـ citrix_uid
+                agent_map = {}
+                cur = conn.execute("SELECT citrix_uid, acd_id, name FROM agents_master")
+                for row in cur:
+                    if row['citrix_uid']:
+                        agent_map[row['citrix_uid'].strip()] = row['citrix_uid']
+                    if row['name']:
+                        agent_map[row['name'].strip()] = row['citrix_uid']
+                    if row['acd_id']:
+                        agent_map[row['acd_id'].strip()] = row['citrix_uid']
+
+                for _, row in melted.iterrows():
+                    citrix = None
+                    # محاولة الحصول على citrix_uid من الأعمدة المختلفة
+                    if citrix_col and citrix_col != 'None' and pd.notna(row.get(citrix_col)):
+                        citrix = agent_map.get(str(row[citrix_col]).strip())
+                    if not citrix and acd_col and acd_col != 'None' and pd.notna(row.get(acd_col)):
+                        citrix = agent_map.get(str(row[acd_col]).strip())
+                    if not citrix and login_col and login_col != 'None' and pd.notna(row.get(login_col)):
+                        citrix = agent_map.get(str(row[login_col]).strip())
+                    if not citrix and pd.notna(row[name_col]):
+                        citrix = agent_map.get(str(row[name_col]).strip())
+
+                    if not citrix:
+                        unknown_agents.append(str(row[name_col]))
+                        continue
+
+                    records.append((
+                        citrix,
+                        row.get(acd_col) if acd_col and acd_col != 'None' else None,
+                        row['shift_date'].date(),
+                        row['raw_shift'],
+                        row['normalized_shift'],
+                        file.name
+                    ))
+
+                if records:
+                    # إدراج في جدول roster_original
+                    conn.executemany(f"""
+                        INSERT INTO roster_original_{year_month}
+                        (citrix_uid, acd_id, shift_date, scheduled_shift, normalized_shift, source_file)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, records)
+                    # إدراج في جدول roster_live (نفس البيانات في البداية)
+                    conn.executemany(f"""
+                        INSERT INTO roster_live_{year_month}
+                        (citrix_uid, acd_id, shift_date, scheduled_shift, normalized_shift, shift_source, source_file)
+                        VALUES (?, ?, ?, ?, ?, 'Planner', ?)
+                    """, records)
+                    conn.commit()
+
+            return {
+                "success": True,
+                "rows_processed": len(records),
+                "unknown_agents": unknown_agents
+            }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
