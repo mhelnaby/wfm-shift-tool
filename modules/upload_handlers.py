@@ -1,7 +1,7 @@
 # modules/upload_handlers.py
 import pandas as pd
 from datetime import datetime
-import re
+import hashlib
 
 class UploadHandler:
     def __init__(self, db, normalizer, audit):
@@ -9,28 +9,45 @@ class UploadHandler:
         self.normalizer = normalizer
         self.audit = audit
 
-    def process_headcount(self, file):
-        """
-        معالجة ملف HC مع إزالة التكرارات والتعامل مع تعارض UNIQUE constraints.
-        """
-        try:
-            # قراءة الملف
-            df = pd.read_csv(file) if file.name.endswith('.csv') else pd.read_excel(file)
+    # ---------- Helper methods ----------
+    def _get_agent_by_login(self, login_id):
+        """ابحث عن الوكيل باستخدام login_id (أو acd_id) وأعد citrix_uid و acd_id."""
+        if not login_id or login_id == '0' or login_id == 'Totals':
+            return None
+        with self.db.connect() as conn:
+            # حاول بـ login_id أولاً
+            cur = conn.execute(
+                "SELECT citrix_uid, acd_id FROM agents_master WHERE login_id = ?",
+                (str(login_id).strip(),)
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            # إذا لم نجد، جرب acd_id
+            cur = conn.execute(
+                "SELECT citrix_uid, acd_id FROM agents_master WHERE acd_id = ?",
+                (str(login_id).strip(),)
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+        return None
 
-            # التحقق من الأعمدة الأساسية
+    # ---------- Headcount ----------
+    def process_headcount(self, file):
+        """معالجة ملف HC (بدون تغيير)"""
+        try:
+            df = pd.read_csv(file) if file.name.endswith('.csv') else pd.read_excel(file)
             required = ['Citrix UID', 'ACD ID', 'Name']
             missing = [c for c in required if c not in df.columns]
             if missing:
                 return {"success": False, "error": f"Missing columns: {missing}"}
 
-            # تنظيف البيانات: إزالة المسافات وتحويل إلى نص
             df['ACD ID'] = df['ACD ID'].astype(str).str.strip()
             df['Citrix UID'] = df['Citrix UID'].astype(str).str.strip()
-
-            # إزالة الصفوف ذات القيم الفارغة في الأعمدة الرئيسية
             df = df.dropna(subset=['Citrix UID', 'ACD ID', 'Name'])
 
-            # إزالة التكرارات داخل الملف على أساس Citrix UID ثم ACD ID
+            # إزالة التكرارات
             before = len(df)
             df = df.drop_duplicates(subset=['Citrix UID'], keep='first')
             df = df.drop_duplicates(subset=['ACD ID'], keep='first')
@@ -48,7 +65,6 @@ class UploadHandler:
                     acd = row['ACD ID']
                     name = row['Name']
 
-                    # تجهيز البيانات
                     data = {
                         'acd_id': acd,
                         'name': name,
@@ -66,7 +82,6 @@ class UploadHandler:
                         'status': row.get('Status', 'Active'),
                     }
 
-                    # تحويل القيم الفارغة إلى None
                     for k, v in data.items():
                         if pd.isna(v):
                             data[k] = None
@@ -75,7 +90,6 @@ class UploadHandler:
                     placeholders = ','.join(['?' for _ in data])
                     values = [citrix] + list(data.values())
 
-                    # التحقق مما إذا كان ACD ID موجوداً بالفعل لشخص آخر
                     existing = conn.execute(
                         "SELECT citrix_uid FROM agents_master WHERE acd_id = ? AND citrix_uid != ?",
                         (acd, citrix)
@@ -84,7 +98,6 @@ class UploadHandler:
                         errors.append(f"ACD ID {acd} already assigned to {existing['citrix_uid']}, skipping {citrix}")
                         continue
 
-                    # محاولة الإدراج أو التحديث باستخدام ON CONFLICT على citrix_uid
                     conn.execute(f"""
                         INSERT INTO agents_master (citrix_uid, {columns}) 
                         VALUES (?, {placeholders})
@@ -106,7 +119,6 @@ class UploadHandler:
                             updated_at = CURRENT_TIMESTAMP
                     """, values)
 
-                    # يمكن تحديث العداد ببساطة
                     new += 1
 
                 conn.commit()
@@ -119,12 +131,10 @@ class UploadHandler:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    # ---------- Roster ----------
     def process_roster(self, file, mapping, year_month):
-        """
-        معالجة ملف Roster (جدول المناوبات) باستخدام mapping المحدد.
-        """
+        """معالجة ملف Roster (جدول المناوبات)"""
         try:
-            # قراءة الملف
             if file.name.endswith('.csv'):
                 df = pd.read_csv(file)
             else:
@@ -136,14 +146,12 @@ class UploadHandler:
             login_col = mapping.get('login_col')
             date_cols = mapping['date_cols']
 
-            # التحقق من وجود الأعمدة
             if name_col not in df.columns:
                 return {"success": False, "error": f"Column '{name_col}' not found."}
             for col in date_cols:
                 if col not in df.columns:
                     return {"success": False, "error": f"Date column '{col}' not found."}
 
-            # قائمة الأعمدة الثابتة (للربط)
             id_vars = [name_col]
             if citrix_col and citrix_col != 'None' and citrix_col in df.columns:
                 id_vars.append(citrix_col)
@@ -152,27 +160,23 @@ class UploadHandler:
             if login_col and login_col != 'None' and login_col in df.columns:
                 id_vars.append(login_col)
 
-            # تحويل الجدول من العرض العريض إلى الطولي
             melted = df.melt(id_vars=id_vars, value_vars=date_cols,
                              var_name='raw_date', value_name='raw_shift')
 
-            # تحويل التاريخ (تنسيق مثل 21-Feb-26)
             try:
                 melted['shift_date'] = pd.to_datetime(melted['raw_date'], format='%d-%b-%y', errors='coerce')
             except:
                 melted['shift_date'] = pd.to_datetime(melted['raw_date'], errors='coerce')
             melted = melted.dropna(subset=['shift_date'])
 
-            # تطبيع الشفتات
             melted['normalized_shift'] = melted['raw_shift'].apply(self.normalizer.normalize)
 
             unknown_agents = []
             records = []
 
             with self.db.connect() as conn:
-                # بناء قاموس للربط بين الاسم / acd_id / login_id و citrix_uid
                 agent_map = {}
-                cur = conn.execute("SELECT citrix_uid, acd_id, name FROM agents_master")
+                cur = conn.execute("SELECT citrix_uid, acd_id, login_id, name FROM agents_master")
                 for row in cur:
                     if row['citrix_uid']:
                         agent_map[row['citrix_uid'].strip()] = row['citrix_uid']
@@ -180,10 +184,11 @@ class UploadHandler:
                         agent_map[row['name'].strip()] = row['citrix_uid']
                     if row['acd_id']:
                         agent_map[str(row['acd_id']).strip()] = row['citrix_uid']
+                    if row['login_id']:
+                        agent_map[str(row['login_id']).strip()] = row['citrix_uid']
 
                 for _, row in melted.iterrows():
                     citrix = None
-                    # محاولة استخراج citrix_uid بالترتيب
                     if citrix_col and citrix_col != 'None' and pd.notna(row.get(citrix_col)):
                         citrix = agent_map.get(str(row[citrix_col]).strip())
                     if not citrix and acd_col and acd_col != 'None' and pd.notna(row.get(acd_col)):
@@ -207,14 +212,12 @@ class UploadHandler:
                     ))
 
                 if records:
-                    # إدراج في جدول roster_original
                     conn.executemany(f"""
                         INSERT INTO roster_original_{year_month}
                         (citrix_uid, acd_id, shift_date, scheduled_shift, normalized_shift, source_file)
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, records)
 
-                    # إدراج في جدول roster_live (نفس البيانات في البداية)
                     conn.executemany(f"""
                         INSERT INTO roster_live_{year_month}
                         (citrix_uid, acd_id, shift_date, scheduled_shift, normalized_shift, shift_source, source_file)
@@ -231,238 +234,316 @@ class UploadHandler:
 
         except Exception as e:
             return {"success": False, "error": str(e)}
-def process_cms_productivity(self, file, year_month):
-    """
-    Process a CMS productivity report and insert into cms_raw_{year_month}.
-    Expected columns (adjust to your file):
-        - Date / Report Date
-        - Agent ID / Citrix UID / ACD ID
-        - Handled / Ans Calls
-        - Talk Time / Handle Time (seconds)
-        - Available Time / Staffed Time
-        - Hold Time
-        - ACW Time
-    """
-    try:
-        # Read file (supports CSV or Excel)
-        if file.name.endswith('.csv'):
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file)
 
-        # Normalize column names: lowercase, replace spaces with underscores
-        df.columns = [str(col).strip().lower().replace(' ', '_') for col in df.columns]
+    # ---------- CMS Productivity ----------
+    def process_cms_productivity(self, file, year_month):
+        """
+        معالجة ملف Agents Productivity Report.
+        يتوقع ملف نصي مفصول بعلامة تبويب ويبدأ بسطر عنوان ثم سطر رأس.
+        """
+        try:
+            if file.name.endswith('.csv') or file.name.endswith('.txt'):
+                df = pd.read_csv(file, sep='\t', skiprows=1, encoding='utf-8')
+            else:
+                df = pd.read_excel(file, skiprows=1)
 
-        # Map columns to database fields (adjust as needed)
-        column_mapping = {
-            'date': 'report_date',          # your file's date column
-            'agent_id': 'citrix_uid',       # or 'citrix_uid', 'acd_id', etc.
-            'handled': 'ans_calls',          # number of answered calls
-            'talk_time': 'handle_time_sec',  # talk time in seconds
-            'avail_time': 'avail_time_sec',  # available time
-            'staffed_time': 'staffed_time_sec',
-            'hold_time': 'hold_time_sec',
-            'acw_time': 'acw_time_sec'
-        }
+            df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
 
-        unknown_agents = []
-        rows_processed = 0
-        upload_batch = datetime.now().strftime('%Y%m%d%H%M%S')
+            required = ['date', 'login_id', 'ans_calls', 'handle_time', 'talk_time', 'hold_time', 'acw_time']
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                return {"success": False, "error": f"Missing columns: {missing}"}
 
-        # For monthly table name
-        table_name = f"cms_raw_{year_month}"
+            batch_id = hashlib.md5(f"{datetime.now()}{file.name}".encode()).hexdigest()[:10]
+            inserted = 0
+            unknown_logins = set()
+            errors = []
 
-        for _, row in df.iterrows():
-            # Extract agent identifier (try common column names)
-            agent_id = None
-            for col in ['citrix_uid', 'agent_id', 'acd_id', 'login_id']:
-                if col in row and pd.notna(row[col]):
-                    agent_id = str(row[col])
-                    break
-            if not agent_id:
-                continue
-
-            # Verify agent exists in agents_master
             with self.db.connect() as conn:
-                cur = conn.execute(
-                    "SELECT citrix_uid FROM agents_master WHERE citrix_uid = ? OR acd_id = ? OR login_id = ?",
-                    (agent_id, agent_id, agent_id)
-                )
-                result = cur.fetchone()
-                if result:
-                    # Use the actual citrix_uid from master if found
-                    actual_citrix = result['citrix_uid']
+                for idx, row in df.iterrows():
+                    login_id = str(row['login_id']).strip()
+                    if not login_id or login_id in ['0', 'Totals']:
+                        continue
+
+                    agent = self._get_agent_by_login(login_id)
+                    if not agent:
+                        unknown_logins.add(login_id)
+                        continue
+
+                    citrix_uid = agent['citrix_uid']
+                    acd_id = agent.get('acd_id')
+
+                    # تحويل التاريخ
+                    try:
+                        date_val = row['date']
+                        if isinstance(date_val, str):
+                            for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%b-%y'):
+                                try:
+                                    report_date = datetime.strptime(date_val, fmt).date()
+                                    break
+                                except:
+                                    continue
+                            else:
+                                report_date = pd.to_datetime(date_val).date()
+                        else:
+                            report_date = pd.to_datetime(date_val).date()
+                    except Exception as e:
+                        errors.append(f"Row {idx}: invalid date {row['date']}")
+                        continue
+
+                    def to_int(val):
+                        if pd.isna(val):
+                            return 0
+                        try:
+                            return int(float(str(val).replace(',', '')))
+                        except:
+                            return 0
+
+                    ans_calls = to_int(row.get('ans_calls', 0))
+                    handle_time = to_int(row.get('handle_time', 0))
+                    talk_time = to_int(row.get('talk_time', 0))
+                    hold_time = to_int(row.get('hold_time', 0))
+                    acw_time = to_int(row.get('acw_time', 0))
+                    avail_time = to_int(row.get('avail_time', 0))
+                    staffed_time = to_int(row.get('staffed_time', 0))
+
+                    conn.execute(f"""
+                        INSERT INTO cms_raw_{year_month}
+                        (report_date, agent_name, login_id, citrix_uid, acd_id,
+                         ans_calls, handle_time_sec, avail_time_sec, staffed_time_sec,
+                         talk_time_sec, hold_time_sec, acw_time_sec, upload_batch)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        report_date,
+                        row.get('name', ''),
+                        login_id,
+                        citrix_uid,
+                        acd_id,
+                        ans_calls,
+                        handle_time,
+                        avail_time,
+                        staffed_time,
+                        talk_time,
+                        hold_time,
+                        acw_time,
+                        batch_id
+                    ))
+                    inserted += 1
+
+                conn.commit()
+
+            return {
+                "success": True,
+                "rows_processed": inserted,
+                "unknown_agents": list(unknown_logins)[:10],
+                "warnings": errors if errors else None
+            }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ---------- Aspect / EIM ----------
+    def process_aspect(self, file, year_month):
+        return self._process_login_logout(file, year_month, table_prefix='aspect_raw')
+
+    def process_eim(self, file, year_month):
+        return self._process_login_logout(file, year_month, table_prefix='eim_raw')
+
+    def _process_login_logout(self, file, year_month, table_prefix):
+        """
+        معالجة ملفات تسجيل الدخول/الخروج (Aspect/EIM).
+        تتعامل مع ملفات EIM و Login-Logout بشكل موحد.
+        """
+        try:
+            # قراءة الملف كله للبحث عن الرأس
+            content = file.read().decode('utf-8', errors='ignore')
+            file.seek(0)
+            lines = content.splitlines()
+
+            # البحث عن سطر الرأس الذي يحتوي على Agent Name و Date
+            header_idx = None
+            for i, line in enumerate(lines[:20]):  # نبحث في أول 20 سطر فقط
+                if 'Agent Name' in line and 'Date' in line:
+                    header_idx = i
+                    break
+                if 'Agent name' in line.lower() and 'date' in line.lower():
+                    header_idx = i
+                    break
+
+            # إذا لم نجد، نبحث عن أي سطر يحتوي على Login ID أو Agent
+            if header_idx is None:
+                for i, line in enumerate(lines[:10]):
+                    if 'Login ID' in line or 'Agent' in line:
+                        header_idx = i
+                        break
+
+            # إذا لم نجد، نفترض أن الرأس في السطر الأول
+            if header_idx is None:
+                header_idx = 0
+
+            # إعادة قراءة الملف باستخدام pandas مع التخطي حتى الرأس
+            # نستخدم sep=None للكشف التلقائي عن الفاصل، و on_bad_lines='skip' لتجاهل الصفوف التالفة
+            df = pd.read_csv(
+                file,
+                sep=None,
+                engine='python',
+                skiprows=header_idx,
+                encoding='utf-8',
+                on_bad_lines='skip'
+            )
+
+            # تنظيف أسماء الأعمدة: إلى lower case وإزالة المسافات
+            df.columns = [str(c).strip().lower().replace(' ', '_') for c in df.columns]
+
+            # التعامل مع الأعمدة المكررة (مثل login_time.1, login_time.2)
+            cols = df.columns.tolist()
+            seen = {}
+            unique_cols = []
+            for col in cols:
+                base = col.split('.')[0]
+                if base not in seen:
+                    seen[base] = True
+                    unique_cols.append(col)
                 else:
-                    unknown_agents.append(agent_id)
-                    continue
+                    # نتجاهل الأعمدة المكررة
+                    pass
+            df = df[unique_cols]
 
-            # Parse date (assume a date column exists)
-            date_val = None
-            for dcol in ['date', 'report_date', 'day']:
-                if dcol in row and pd.notna(row[dcol]):
-                    date_val = row[dcol]
-                    break
-            if date_val is None:
-                continue
-            # Convert to date object
-            if isinstance(date_val, str):
-                try:
-                    date_obj = datetime.strptime(date_val, '%Y-%m-%d').date()
-                except:
-                    date_obj = pd.to_datetime(date_val).date()
-            else:
-                date_obj = pd.to_datetime(date_val).date()
+            # تعيين event_date من العمود date إذا وجد
+            if 'date' in df.columns:
+                df.rename(columns={'date': 'event_date'}, inplace=True)
 
-            # Extract numeric fields (default to 0)
-            ans_calls = int(row.get('handled', 0) or 0)
-            handle_time = int(row.get('talk_time', 0) or 0)
-            avail_time = int(row.get('avail_time', 0) or 0)
-            staffed_time = int(row.get('staffed_time', 0) or 0)
-            hold_time = int(row.get('hold_time', 0) or 0)
-            acw_time = int(row.get('acw_time', 0) or 0)
-
-            # Insert into monthly table
-            with self.db.connect() as conn:
-                conn.execute(f"""
-                    INSERT INTO {table_name}
-                    (report_date, citrix_uid, ans_calls, handle_time_sec,
-                     avail_time_sec, staffed_time_sec, hold_time_sec,
-                     acw_time_sec, upload_batch, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, (date_obj, actual_citrix, ans_calls, handle_time,
-                      avail_time, staffed_time, hold_time, acw_time, upload_batch))
-                rows_processed += 1
-
-        return {
-            'success': True,
-            'rows_processed': rows_processed,
-            'unknown_agents': list(set(unknown_agents))[:10]   # limit to first 10
-        }
-
-    except Exception as e:
-        # Optionally log the error to your error_log table
-        # self.db.log_error(...)
-        return {'success': False, 'error': str(e)}
-def process_aspect_eim(self, file, year_month):
-    """
-    Process an Aspect or EIM event report and insert into aspect_raw_{year_month}
-    or eim_raw_{year_month} depending on the file type.
-    Expected columns:
-        - Agent Name / Login ID / Citrix UID
-        - Event Date
-        - Login Time / Logout Time
-        - Logout Reason
-        - Session Duration
-    """
-    try:
-        # Determine if it's Aspect or EIM (you could detect by filename or content)
-        # For simplicity, assume you pass a parameter; here we'll just use 'aspect_raw'
-        # But you might want to check file.name to decide.
-        if 'eim' in file.name.lower():
-            table_name = f"eim_raw_{year_month}"
-        else:
-            table_name = f"aspect_raw_{year_month}"
-
-        if file.name.endswith('.csv'):
-            df = pd.read_csv(file)
-        else:
-            df = pd.read_excel(file)
-
-        df.columns = [str(col).strip().lower().replace(' ', '_') for col in df.columns]
-
-        unknown_agents = []
-        rows_processed = 0
-        upload_batch = datetime.now().strftime('%Y%m%d%H%M%S')
-
-        for _, row in df.iterrows():
-            # Identify agent
-            agent_id = None
-            for col in ['citrix_uid', 'agent_id', 'acd_id', 'login_id']:
-                if col in row and pd.notna(row[col]):
-                    agent_id = str(row[col])
-                    break
-            if not agent_id:
-                # Try agent_name if present (but need mapping)
-                continue
-
-            with self.db.connect() as conn:
-                cur = conn.execute(
-                    "SELECT citrix_uid FROM agents_master WHERE citrix_uid = ? OR acd_id = ? OR login_id = ?",
-                    (agent_id, agent_id, agent_id)
-                )
-                result = cur.fetchone()
-                if result:
-                    actual_citrix = result['citrix_uid']
+            # تعيين login_id
+            if 'login_id' not in df.columns:
+                # البحث عن عمود يشبه login
+                for col in df.columns:
+                    if 'login' in col:
+                        df.rename(columns={col: 'login_id'}, inplace=True)
+                        break
                 else:
-                    unknown_agents.append(agent_id)
-                    continue
+                    # إذا لم نجد، نبحث عن أي عمود id
+                    for col in df.columns:
+                        if 'id' in col:
+                            df.rename(columns={col: 'login_id'}, inplace=True)
+                            break
 
-            # Event date
-            date_val = None
-            for dcol in ['event_date', 'date', 'day']:
-                if dcol in row and pd.notna(row[dcol]):
-                    date_val = row[dcol]
-                    break
-            if date_val is None:
-                continue
-            if isinstance(date_val, str):
-                date_obj = datetime.strptime(date_val, '%Y-%m-%d').date()
-            else:
-                date_obj = pd.to_datetime(date_val).date()
+            # التحقق من وجود الأعمدة الأساسية
+            required = ['login_id', 'event_date']
+            missing = [r for r in required if r not in df.columns]
+            if missing:
+                return {"success": False, "error": f"Missing columns: {missing}"}
 
-            # Login and logout times
-            login_time = None
-            logout_time = None
-            for tcol in ['login_time', 'login']:
-                if tcol in row and pd.notna(row[tcol]):
-                    login_time = row[tcol]
-                    break
-            for tcol in ['logout_time', 'logout']:
-                if tcol in row and pd.notna(row[tcol]):
-                    logout_time = row[tcol]
-                    break
+            # إزالة الصفوف ذات login_id فارغ
+            df = df.dropna(subset=['login_id'])
+            df['login_id'] = df['login_id'].astype(str).str.strip()
 
-            # Convert to datetime if needed
-            if login_time and isinstance(login_time, str):
-                try:
-                    login_dt = datetime.strptime(login_time, '%Y-%m-%d %H:%M:%S')
-                except:
-                    login_dt = pd.to_datetime(login_time).to_pydatetime()
-            else:
-                login_dt = login_time
+            batch_id = hashlib.md5(f"{datetime.now()}{file.name}".encode()).hexdigest()[:10]
+            inserted = 0
+            unknown_logins = set()
+            errors = []
 
-            if logout_time and isinstance(logout_time, str):
-                try:
-                    logout_dt = datetime.strptime(logout_time, '%Y-%m-%d %H:%M:%S')
-                except:
-                    logout_dt = pd.to_datetime(logout_time).to_pydatetime()
-            else:
-                logout_dt = logout_time
-
-            logout_reason = row.get('logout_reason', '') or ''
-            session_duration = int(row.get('session_duration_sec', 0) or 0)
-
-            # Insert
             with self.db.connect() as conn:
-                conn.execute(f"""
-                    INSERT INTO {table_name}
-                    (agent_name, login_id, citrix_uid, acd_id, event_date,
-                     login_time, logout_time, logout_reason, session_duration_sec,
-                     upload_batch, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, (
-                    row.get('agent_name', ''), row.get('login_id', ''),
-                    actual_citrix, row.get('acd_id', ''),
-                    date_obj, login_dt, logout_dt, logout_reason,
-                    session_duration, upload_batch
-                ))
-                rows_processed += 1
+                for idx, row in df.iterrows():
+                    login_id = row['login_id']
+                    if not login_id or login_id in ['0', 'Totals']:
+                        continue
 
-        return {
-            'success': True,
-            'rows_processed': rows_processed,
-            'unknown_agents': list(set(unknown_agents))[:10]
-        }
+                    agent = self._get_agent_by_login(login_id)
+                    if not agent:
+                        unknown_logins.add(login_id)
+                        continue
 
-    except Exception as e:
-        return {'success': False, 'error': str(e)}
+                    citrix_uid = agent['citrix_uid']
+                    acd_id = agent.get('acd_id')
+
+                    # تاريخ الحدث
+                    try:
+                        date_val = row['event_date']
+                        if isinstance(date_val, str):
+                            for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%b-%y'):
+                                try:
+                                    event_date = datetime.strptime(date_val, fmt).date()
+                                    break
+                                except:
+                                    continue
+                            else:
+                                event_date = pd.to_datetime(date_val).date()
+                        else:
+                            event_date = pd.to_datetime(date_val).date()
+                    except Exception as e:
+                        errors.append(f"Row {idx}: invalid event_date {row.get('event_date')}")
+                        continue
+
+                    # أوقات الدخول والخروج
+                    login_time = row.get('login_time')
+                    logout_time = row.get('logout_time')
+                    logout_date_str = row.get('logout_date')
+
+                    login_dt = None
+                    logout_dt = None
+                    duration = 0
+
+                    if login_time and login_time != '0' and pd.notna(login_time):
+                        try:
+                            if isinstance(login_time, str):
+                                login_dt = datetime.strptime(login_time.strip(), '%I:%M%p')
+                                login_dt = login_dt.replace(year=event_date.year, month=event_date.month, day=event_date.day)
+                            else:
+                                login_dt = pd.to_datetime(login_time).to_pydatetime()
+                        except:
+                            pass
+
+                    if logout_time and logout_time != '0' and pd.notna(logout_time):
+                        try:
+                            logout_date = event_date
+                            if logout_date_str and pd.notna(logout_date_str):
+                                try:
+                                    logout_date = datetime.strptime(str(logout_date_str).strip(), '%d/%m/%Y').date()
+                                except:
+                                    pass
+                            if isinstance(logout_time, str):
+                                logout_dt = datetime.strptime(logout_time.strip(), '%I:%M%p')
+                                logout_dt = logout_dt.replace(year=logout_date.year, month=logout_date.month, day=logout_date.day)
+                            else:
+                                logout_dt = pd.to_datetime(logout_time).to_pydatetime()
+                        except:
+                            pass
+
+                    if login_dt and logout_dt:
+                        duration = int((logout_dt - login_dt).total_seconds())
+                        if duration < 0:
+                            duration = 0
+
+                    logout_reason = row.get('logout_reason', '')
+
+                    conn.execute(f"""
+                        INSERT INTO {table_prefix}_{year_month}
+                        (agent_name, login_id, citrix_uid, acd_id, event_date,
+                         login_time, logout_time, logout_reason, session_duration_sec,
+                         upload_batch)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        row.get('agent_name', ''),
+                        login_id,
+                        citrix_uid,
+                        acd_id,
+                        event_date,
+                        login_dt,
+                        logout_dt,
+                        logout_reason,
+                        duration,
+                        batch_id
+                    ))
+                    inserted += 1
+
+                conn.commit()
+
+            return {
+                "success": True,
+                "rows_processed": inserted,
+                "unknown_agents": list(unknown_logins)[:10],
+                "warnings": errors if errors else None
+            }
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}

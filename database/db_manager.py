@@ -1,3 +1,4 @@
+# database/db_manager.py
 import sqlite3
 import os
 from datetime import datetime
@@ -13,7 +14,6 @@ class DatabaseManager:
     def get_connection(self):
         db_file = os.path.join(self.db_path, f"wfm_storage_{self.year}.db")
         conn = sqlite3.connect(db_file, check_same_thread=False)
-        # Enforce foreign key constraints
         conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         return conn
@@ -130,7 +130,7 @@ class DatabaseManager:
                 )
             """)
 
-            # Shift swaps (moved from ensure_monthly_tables)
+            # Shift swaps
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS shift_swaps (
                     swap_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,7 +172,7 @@ class DatabaseManager:
                 )
             """)
 
-            # Aspect/EIM raw events
+            # Aspect/EIM events aggregated
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS aspect_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,7 +209,7 @@ class DatabaseManager:
                 )
             """)
 
-            # Roster live (with approval tracking)
+            # Roster live
             cursor.execute(f"""
                 CREATE TABLE IF NOT EXISTS roster_live_{year_month} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -279,6 +279,7 @@ class DatabaseManager:
                     event_date DATE NOT NULL,
                     login_time DATETIME,
                     logout_time DATETIME,
+                    logout_reason TEXT,
                     session_duration_sec INTEGER,
                     upload_batch TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -286,7 +287,7 @@ class DatabaseManager:
                 )
             """)
 
-            # Attendance processed (final output)
+            # Attendance processed
             cursor.execute(f"""
                 CREATE TABLE IF NOT EXISTS attendance_processed_{year_month} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -314,7 +315,6 @@ class DatabaseManager:
 
     def log_error(self, error_type, source_file, source_type, raw_data,
                   agent_name=None, login_id=None, acd_id=None, shift_date=None):
-        """Convenience method to log an error."""
         with self.connect() as conn:
             conn.execute("""
                 INSERT INTO error_log

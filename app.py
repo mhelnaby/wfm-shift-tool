@@ -1,14 +1,10 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 from datetime import datetime
-import os
-
-# Import database manager
 from database.db_manager import DatabaseManager
 
 # -------------------- Page config (must be first Streamlit command) --------------------
-st.set_page_config(page_title="WFM Shift Tool", layout="wide")
+st.set_page_config(page_title="WFM Command Center", layout="wide")
 
 # -------------------- Initialize database --------------------
 db = DatabaseManager(year=2026, db_path="./data")
@@ -25,9 +21,8 @@ if 'role' not in st.session_state:
 
 # -------------------- Login screen (if not authenticated) --------------------
 if not st.session_state.authenticated:
-    # Use a centered layout for login
     st.markdown("<style>div.block-container{max-width: 500px;}</style>", unsafe_allow_html=True)
-    st.title("🔐 WFM Command Center Tool - Login")
+    st.title("🔐 WFM Command Center - Login")
     
     with st.form("login_form"):
         citrix_uid = st.text_input("Citrix UID")
@@ -44,10 +39,10 @@ if not st.session_state.authenticated:
                 st.rerun()
             else:
                 st.error("User not found")
-    st.stop()  # Stop execution here if not authenticated
+    st.stop()
 
 # -------------------- Main App (authenticated) --------------------
-st.title("📊 WFM Command Center Tool")
+st.title("📊 WFM Command Center")
 st.caption(f"Welcome {st.session_state.user['full_name']} - ({st.session_state.role})")
 
 # -------------------- Sidebar navigation --------------------
@@ -94,7 +89,6 @@ elif selected == "Upload Files":
     st.subheader("📤 Upload Files")
     tab1, tab2, tab3, tab4 = st.tabs(["Headcount", "Roster", "CMS", "Aspect/EIM"])
     
-    # Import handlers once (they are used in multiple tabs)
     from modules.upload_handlers import UploadHandler
     from modules.normalization import ShiftNormalizer
     from modules.audit import AuditLogger
@@ -120,7 +114,6 @@ elif selected == "Upload Files":
         roster_file = st.file_uploader("Choose Roster file", type=['csv', 'xlsx'], key="roster")
         if roster_file is not None:
             try:
-                # Preview file
                 if roster_file.name.endswith('.csv'):
                     df = pd.read_csv(roster_file)
                 else:
@@ -128,10 +121,8 @@ elif selected == "Upload Files":
                 st.write("Preview:")
                 st.dataframe(df.head())
                 
-                # Auto‑detect columns based on your fixed structure
                 fixed_cols = ['Name', 'Citrix UID']
                 date_cols = [col for col in df.columns if col not in fixed_cols]
-                
                 st.info(f"Detected {len(date_cols)} date columns automatically.")
                 
                 if st.button("Process Roster", key="process_roster"):
@@ -146,8 +137,6 @@ elif selected == "Upload Files":
                             'date_cols': date_cols
                         }
                         year_month = f"{datetime.now().year}_{datetime.now().month:02d}"
-                        
-                        # Reset file pointer
                         roster_file.seek(0)
                         
                         with st.spinner("Processing..."):
@@ -181,7 +170,6 @@ elif selected == "Upload Files":
         if aspect_file and st.button("Process Aspect/EIM", key="process_aspect"):
             with st.spinner("Processing..."):
                 year_month = datetime.now().strftime('%Y_%m')
-                # Determine if it's Aspect or EIM based on filename
                 if 'eim' in aspect_file.name.lower():
                     result = handler.process_eim(aspect_file, year_month)
                 else:
@@ -195,7 +183,6 @@ elif selected == "Upload Files":
 
 elif selected == "Swap Manager":
     st.subheader("🔄 Swap Requests")
-    
     with st.form("swap_request"):
         st.write("##### New Swap Request")
         col1, col2 = st.columns(2)
@@ -205,7 +192,6 @@ elif selected == "Swap Manager":
         with col2:
             new_shift = st.text_input("New Shift (or leave type)")
             leave_type = st.selectbox("Leave Type", ["None", "Sick", "Annual", "Half Day Annual", "Casual", "Ops Update"])
-        
         submitted = st.form_submit_button("Submit Request")
         if submitted:
             st.success("Request submitted successfully (demo)")
@@ -216,7 +202,6 @@ elif selected == "Approvals":
 
 elif selected == "Admin Panel":
     st.subheader("⚙️ System Settings")
-    
     tab1, tab2, tab3 = st.tabs(["Users", "Shift Dictionary", "LOB Groups"])
     
     with tab1:
@@ -243,7 +228,6 @@ elif selected == "Admin Panel":
     with tab2:
         st.write("##### Shift Dictionary")
         st.info("Here you will manage shift patterns.")
-    
     with tab3:
         st.write("##### LOB Groups")
         st.info("Here you will manage LOB groups.")
@@ -263,12 +247,10 @@ elif selected == "Export Data":
     with col2:
         st.write("##### Preview")
         st.info("Preview will be shown here.")
-    
     if st.button("Export"):
         st.success("Export completed successfully (demo)")
 
 elif selected == "Reports":
-    st.subheader("📋 Reports")
-    report_type = st.selectbox("Report Type", ["Absenteeism Report", "Adherence Report", "Swap Report"])
-    if st.button("Generate Report"):
-        st.info("Report will be generated here (demo)")
+    # استدعاء صفحة التقارير من الملف المنفصل
+    import Reports
+    Reports.main(db)   # نمرر كائن db للاستخدام

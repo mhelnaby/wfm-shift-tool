@@ -1,0 +1,5 @@
+echo "__pycache__/" >> .gitignore
+echo "*.pyc" >> .gitignore
+git add .gitignore
+git commit -m "chore: add __pycache__ to gitignore"
+git push
